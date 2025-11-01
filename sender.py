@@ -180,7 +180,11 @@ class URPSender:
             self.stats['total_data_sent'] += payload_len
             
             # If not a retransmission, add to unacked list
-            if not is_retransmission:
+            # (For stop-and-wait DATA, SYN, and FIN, we already added them before sending)
+            # Only add here for sliding window DATA segments
+            if not is_retransmission and self.max_win > MSS:
+                # For sliding window, add to unacked list here
+                # For stop-and-wait DATA, SYN, and FIN, segment was already added before sending
                 with self.window_lock:
                     self.unacked_segments.append((
                         segment.seq_num,
@@ -235,6 +239,7 @@ class URPSender:
         """
         Process a received ACK segment.
         Updates window, removes acknowledged segments, handles duplicates.
+        Returns True if ACK was processed, False otherwise.
         """
         if not segment.is_ack():
             return False
@@ -284,18 +289,18 @@ class URPSender:
                 self.last_ack_num = ack_num
                 return True
                 
-            elif ack_num == self.last_ack_num:
+            elif self.last_ack_num is not None and ack_num == self.last_ack_num:
                 # Duplicate ACK
                 self.dup_ack_count += 1
                 self.stats['duplicate_acks_received'] += 1
                 
-                # Fast retransmit on 3 duplicate ACKs
-                if self.dup_ack_count == 3:
+                # Fast retransmit on 3 duplicate ACKs (only in sliding window mode)
+                if self.dup_ack_count == 3 and self.max_win > MSS:
                     self.retransmit_oldest()
                 return True
                 
             else:
-                # Ignore old ACK
+                # Ignore old ACK or first ACK (last_ack_num is None)
                 return True
                 
         return False
@@ -308,33 +313,59 @@ class URPSender:
         self.state = SYN_SENT
         self.start_time = time.time()
         
-        # Create and send SYN segment
+        # Create SYN segment
         syn_segment = URPSegment(self.isn, 0, b'')
         syn_segment.set_flag('SYN')
         
-        self.send_segment(syn_segment)
+        # Track SYN segment before sending so we can retransmit if dropped
+        segment_data = syn_segment.encode()
+        with self.window_lock:
+            self.unacked_segments.append((
+                self.isn,
+                segment_data,
+                0,  # SYN has no payload
+                time.time()
+            ))
+            # Start timer
+            self.start_timer()
+        
+        self.send_segment(syn_segment, is_retransmission=False)
         
         # Wait for ACK
         while self.state == SYN_SENT:
             try:
+                self.socket.settimeout(0.01)
                 data, addr = self.socket.recvfrom(1024)
+                
+                # Try to decode first to get sequence number for logging
+                temp_segment = URPSegment.decode(data)
+                ack_seq_num = temp_segment.seq_num if temp_segment else 0
                 
                 # Process through PLC
                 ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                    data, 'ACK', 0, 0, self.get_elapsed_time()
+                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
                 )
                 
                 if was_dropped:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Decode segment
                 ack_segment = URPSegment.decode(ack_segment_raw)
                 if ack_segment is None:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Verify checksum
                 if not ack_segment.verify_checksum():
                     self.stats['corrupted_acks_discarded'] += 1
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Check if ACK acknowledges SYN (ACK num should be ISN + 1)
@@ -358,6 +389,7 @@ class URPSender:
         """
         Transfer file data using sliding window protocol.
         Operates in ESTABLISHED state.
+        Supports both stop-and-wait (max_win = MSS) and sliding window.
         """
         file = open(self.filename, 'rb')
         
@@ -372,32 +404,126 @@ class URPSender:
                 
                 if len(data) > 0:
                     # Create DATA segment
-                    data_segment = URPSegment(self.next_seq, 0, data)
+                    current_seq = self.next_seq
+                    current_payload_len = len(data)
+                    data_segment = URPSegment(current_seq, 0, data)
+                    
+                    # In stop-and-wait mode, track segment before sending
+                    # so we can retransmit even if dropped
+                    if self.max_win == MSS:
+                        # For stop-and-wait, ensure segment is tracked for retransmission
+                        # even if dropped by PLC
+                        segment_data = data_segment.encode()
+                        with self.window_lock:
+                            # Check if this segment is already tracked
+                            if len(self.unacked_segments) == 0 or self.unacked_segments[0][0] != current_seq:
+                                self.unacked_segments.append((
+                                    current_seq,
+                                    segment_data,
+                                    current_payload_len,
+                                    time.time()
+                                ))
+                                # Start timer if this is the oldest unacked segment
+                                if len(self.unacked_segments) == 1:
+                                    self.start_timer()
+                    
                     self.send_segment(data_segment)
                     
-                    self.next_seq = (self.next_seq + len(data)) % 65536
-                    self.file_pointer += len(data)
+                    # In stop-and-wait mode (max_win == MSS), wait for ACK before continuing
+                    if self.max_win == MSS:
+                        # Wait for ACK of this segment
+                        while len(self.unacked_segments) > 0:
+                            try:
+                                self.socket.settimeout(0.01)
+                                data, addr = self.socket.recvfrom(1024)
+                                
+                                # Try to decode first to get sequence number for logging
+                                temp_segment = URPSegment.decode(data)
+                                ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                                
+                                # Process through PLC
+                                ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
+                                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
+                                )
+                                
+                                if was_dropped:
+                                    # Check for timeout while waiting
+                                    if self.check_timer():
+                                        self.retransmit_oldest()
+                                    continue
+                                    
+                                # Decode and verify
+                                ack_segment = URPSegment.decode(ack_segment_raw)
+                                if ack_segment is None:
+                                    # Check for timeout
+                                    if self.check_timer():
+                                        self.retransmit_oldest()
+                                    continue
+                                    
+                                if not ack_segment.verify_checksum():
+                                    self.stats['corrupted_acks_discarded'] += 1
+                                    # Check for timeout
+                                    if self.check_timer():
+                                        self.retransmit_oldest()
+                                    continue
+                                    
+                                # Process ACK
+                                ack_processed = self.process_ack(ack_segment)
+                                
+                                # Break out of wait loop if segment was ACKed
+                                # Check unacked_segments with lock for thread safety
+                                with self.window_lock:
+                                    if len(self.unacked_segments) == 0:
+                                        # Segment was ACKed - now safe to increment
+                                        self.next_seq = (self.next_seq + current_payload_len) % 65536
+                                        self.file_pointer += current_payload_len
+                                        break
+                                    
+                                # Check for timeout after processing ACK (in case it didn't acknowledge)
+                                if self.check_timer():
+                                    self.retransmit_oldest()
+                                    
+                            except timeout:
+                                # Check for timer expiration
+                                if self.check_timer():
+                                    self.retransmit_oldest()
+                                continue
+                        # Continue to next iteration to send next segment
+                        continue
                     
-            # Check for incoming ACKs
+            # Check for incoming ACKs (for sliding window mode)
             try:
                 self.socket.settimeout(0.01)
                 data, addr = self.socket.recvfrom(1024)
                 
+                # Try to decode first to get sequence number for logging
+                temp_segment = URPSegment.decode(data)
+                ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                
                 # Process through PLC
                 ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                    data, 'ACK', 0, 0, self.get_elapsed_time()
+                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
                 )
                 
                 if was_dropped:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Decode and verify
                 ack_segment = URPSegment.decode(ack_segment_raw)
                 if ack_segment is None:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 if not ack_segment.verify_checksum():
                     self.stats['corrupted_acks_discarded'] += 1
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Process ACK
@@ -417,19 +543,32 @@ class URPSender:
                 self.socket.settimeout(0.01)
                 data, addr = self.socket.recvfrom(1024)
                 
+                # Try to decode first to get sequence number for logging
+                temp_segment = URPSegment.decode(data)
+                ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                
                 ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                    data, 'ACK', 0, 0, self.get_elapsed_time()
+                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
                 )
                 
                 if was_dropped:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 ack_segment = URPSegment.decode(ack_segment_raw)
                 if ack_segment is None:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 if not ack_segment.verify_checksum():
                     self.stats['corrupted_acks_discarded'] += 1
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 self.process_ack(ack_segment)
@@ -448,12 +587,25 @@ class URPSender:
         """
         self.state = FIN_WAIT
         
-        # Create and send FIN segment
+        # Create FIN segment
         fin_seq = self.next_seq
         fin_segment = URPSegment(fin_seq, 0, b'')
         fin_segment.set_flag('FIN')
         
-        self.send_segment(fin_segment)
+        # Track FIN segment before sending so we can retransmit if dropped
+        segment_data = fin_segment.encode()
+        with self.window_lock:
+            self.unacked_segments.append((
+                fin_seq,
+                segment_data,
+                0,  # FIN has no payload
+                time.time()
+            ))
+            # Start timer if there are no other unacked segments
+            if len(self.unacked_segments) == 1:
+                self.start_timer()
+        
+        self.send_segment(fin_segment, is_retransmission=False)
         
         # Wait for ACK
         while self.state == FIN_WAIT:
@@ -461,23 +613,37 @@ class URPSender:
                 self.socket.settimeout(0.01)
                 data, addr = self.socket.recvfrom(1024)
                 
+                # Try to decode first to get sequence number for logging
+                temp_segment = URPSegment.decode(data)
+                ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                
                 ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                    data, 'ACK', 0, 0, self.get_elapsed_time()
+                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
                 )
                 
                 if was_dropped:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 ack_segment = URPSegment.decode(ack_segment_raw)
                 if ack_segment is None:
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 if not ack_segment.verify_checksum():
                     self.stats['corrupted_acks_discarded'] += 1
+                    # Check for timeout
+                    if self.check_timer():
+                        self.retransmit_oldest()
                     continue
                     
                 # Check if ACK acknowledges FIN (ACK num should be FIN seq + 1)
-                if ack_segment.is_ack() and ack_segment.seq_num == fin_seq + 1:
+                expected_ack = (fin_seq + 1) % 65536
+                if ack_segment.is_ack() and ack_segment.seq_num == expected_ack:
                     self.state = CLOSED
                     # Remove FIN from unacked list
                     with self.window_lock:
