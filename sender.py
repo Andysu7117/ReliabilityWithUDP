@@ -429,6 +429,12 @@ class URPSender:
                     
                     self.send_segment(data_segment)
                     
+                    # In sliding window mode, increment immediately after sending
+                    # In stop-and-wait mode, we'll increment after ACK
+                    if self.max_win > MSS:
+                        self.next_seq = (self.next_seq + current_payload_len) % 65536
+                        self.file_pointer += current_payload_len
+                    
                     # In stop-and-wait mode (max_win == MSS), wait for ACK before continuing
                     if self.max_win == MSS:
                         # Wait for ACK of this segment
