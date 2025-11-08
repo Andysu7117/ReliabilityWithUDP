@@ -208,35 +208,40 @@ class URPSender:
         with self.window_lock:
             if len(self.unacked_segments) == 0:
                 return
-                
-            seq_num, segment_data, payload_len, send_time = self.unacked_segments[0]
-            
-        # Determine segment type (outside lock)
+            seq_num, segment_data, payload_len, _ = self.unacked_segments[0]
+            # Update send time for this retransmission
+            self.unacked_segments[0] = (seq_num, segment_data, payload_len, time.time())
+
         segment = URPSegment.decode(segment_data)
         if segment is None:
             return
-            
+
         seg_type = 'SYN' if segment.is_syn() else ('FIN' if segment.is_fin() else 'DATA')
-        
-        # Check if timeout or fast retransmit
+
         if self.check_timer():
             self.stats['timeout_retransmissions'] += 1
         else:
             self.stats['fast_retransmissions'] += 1
-            
-        # Retransmit
-        processed_data, was_dropped, was_corrupted = self.plc.process_outgoing(
+
+        processed_data, was_dropped, _ = self.plc.process_outgoing(
             segment_data, seg_type, seq_num, payload_len, self.get_elapsed_time()
         )
-        
+
         if not was_dropped:
             self.socket.sendto(processed_data, ('127.0.0.1', self.receiver_port))
             self.stats['total_segments_sent'] += 1
             self.stats['total_data_sent'] += payload_len
-            
-        # Restart timer
+
         self.restart_timer()
-        self.dup_ack_count = 0  # Reset duplicate ACK count
+        self.dup_ack_count = 0  
+
+    def seq_gt(a, b):
+        """Return True if a > b (mod 2^16)."""
+        return ((a - b + 65536) % 65536) < 32768 and a != b
+
+    def seq_ge(a, b):
+        """Return True if a >= b (mod 2^16)."""
+        return ((a - b + 65536) % 65536) < 32768
             
     def process_ack(self, segment):
         """
@@ -251,62 +256,59 @@ class URPSender:
         
         # Check if this acknowledges new data
         with self.window_lock:
-            # Check if ACK acknowledges new data (handle sequence number wraparound)
-            # For 16-bit sequence numbers, we need to handle wraparound
-            # ACK is ahead if: ack_num > send_base (normal) OR wraparound occurred
-            ack_ahead = False
-            
-            if ack_num > self.send_base:
-                # Normal case: ACK is ahead
-                ack_ahead = True
-            elif ack_num < self.send_base:
-                # Wraparound case: ACK wrapped around while send_base didn't
-                # This happens when send_base is near 65535
-                if self.send_base > 63000:  # Close to wraparound
-                    ack_ahead = True
-            
-            if ack_ahead:
-                # New ACK - slide window
-                # Remove all segments with seq_num < ack_num
+            if len(self.unacked_segments) == 0:
+                return True
+
+            # Check if this ACK acknowledges new data
+            # An ACK acknowledges new data only if it acknowledges at least one segment
+            acknowledges_new_data = False
+            if self.seq_gt(ack_num, self.send_base):
+                # Try to remove acknowledged segments
                 removed_bytes = 0
+                segments_removed = 0
                 while len(self.unacked_segments) > 0:
                     seq_num, _, payload_len, _ = self.unacked_segments[0]
-                    # Compare sequence numbers (handle wraparound)
-                    # seq_num < ack_num in normal case, or if wraparound occurred
-                    if seq_num < ack_num or (ack_num < seq_num and seq_num > 60000 and ack_num < 1000):
+                    if self.seq_ge(ack_num, (seq_num + payload_len) % 65536):
                         self.unacked_segments.pop(0)
                         removed_bytes += payload_len
+                        segments_removed += 1
                     else:
                         break
+                
+                # Only update send_base if we actually removed segments
+                if segments_removed > 0:
+                    acknowledges_new_data = True
+                    self.send_base = ack_num
 
-                self.send_base = ack_num
-                
-                # Restart timer if there are unacked segments
-                if len(self.unacked_segments) > 0:
-                    self.restart_timer()
-                else:
-                    self.stop_timer()
-                    
-                # Reset duplicate ACK count
-                self.dup_ack_count = 0
-                self.last_ack_num = ack_num
-                return True
-                
-            elif self.last_ack_num is not None and ack_num == self.last_ack_num:
+                    # Restart or stop timer based on unacked segments
+                    if len(self.unacked_segments) > 0:
+                        self.restart_timer()
+                    else:
+                        self.stop_timer()
+
+                    # Reset duplicate ACK count
+                    self.dup_ack_count = 0
+                    self.last_ack_num = ack_num
+                    return True
+
+            # Check for duplicate ACK (same ACK number as last one)
+            if self.last_ack_num is not None and ack_num == self.last_ack_num:
                 # Duplicate ACK
                 self.dup_ack_count += 1
                 self.stats['duplicate_acks_received'] += 1
-                
-                # Fast retransmit on 3 duplicate ACKs (only in sliding window mode)
-                if self.dup_ack_count == 3 and self.max_win > MSS:
+
+                # Fast retransmit on >=3 duplicate ACKs
+                if self.dup_ack_count >= 3 and self.max_win > MSS:
                     self.retransmit_oldest()
                 return True
-                
+
             else:
-                # Ignore old ACK or first ACK (last_ack_num is None)
+                # Old ACK or first ACK (last_ack_num is None)
+                # Set last_ack_num so we can detect duplicates next time
+                if self.last_ack_num is None:
+                    self.last_ack_num = ack_num
+                # If ack_num < send_base, it's an old ACK - ignore it
                 return True
-                
-        return False
         
     def connection_setup(self):
         """
@@ -396,7 +398,8 @@ class URPSender:
         """
         file = open(self.filename, 'rb')
         
-        while self.file_pointer < self.file_size:
+        # Continue loop while we have data to send OR unacked segments
+        while self.file_pointer < self.file_size or len(self.unacked_segments) > 0:
             # In sliding window mode, try to send multiple segments before checking ACKs
             # In stop-and-wait mode, send one segment and wait for ACK
             segments_sent_this_iteration = 0
@@ -516,51 +519,80 @@ class URPSender:
                 # No need for explicit break here - let the loop condition handle it
             
             # Check for incoming ACKs (for sliding window mode)
-            # Only check if we're in sliding window mode
+            # Keep checking until window space is available or we've processed enough ACKs
             if self.max_win > MSS:
-                try:
-                    self.socket.settimeout(0.01)
-                    data, addr = self.socket.recvfrom(1024)
+                # Check for ACKs while window is full or we have unacked segments
+                # This loop should continue as long as we have unacked segments or can send more data
+                # Keep checking for ACKs until we can send more data or have no unacked segments
+                while True:
+                    available = self.get_available_window_space()
                     
-                    # Try to decode first to get sequence number for logging
-                    temp_segment = URPSegment.decode(data)
-                    ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                    # If window has space and we have more data to send, break to send more
+                    if available >= MSS and self.file_pointer < self.file_size:
+                        break
                     
-                    # Process through PLC
-                    ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                        data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
-                    )
+                    # If no unacked segments, break
+                    with self.window_lock:
+                        if len(self.unacked_segments) == 0:
+                            break
                     
-                    if was_dropped:
-                        # Check for timeout
-                        if self.check_timer():
-                            self.retransmit_oldest()
+                    # Check timer before trying to receive (important for packet loss scenarios)
+                    if self.check_timer():
+                        self.retransmit_oldest()
+                        # After retransmission, continue loop to check for ACKs
+                        # Don't break - we want to keep checking for ACKs
+                    
+                    try:
+                        self.socket.settimeout(0.01)
+                        data, addr = self.socket.recvfrom(1024)
+                        
+                        # Try to decode first to get sequence number for logging
+                        temp_segment = URPSegment.decode(data)
+                        ack_seq_num = temp_segment.seq_num if temp_segment else 0
+                        
+                        # Process through PLC
+                        ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
+                            data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
+                        )
+                        
+                        if was_dropped:
+                            # Check for timeout
+                            if self.check_timer():
+                                self.retransmit_oldest()
+                            continue
+                            
+                        # Decode and verify
+                        ack_segment = URPSegment.decode(ack_segment_raw)
+                        if ack_segment is None:
+                            # Check for timeout
+                            if self.check_timer():
+                                self.retransmit_oldest()
+                            continue
+                            
+                        if not ack_segment.verify_checksum():
+                            self.stats['corrupted_acks_discarded'] += 1
+                            # Check for timeout
+                            if self.check_timer():
+                                self.retransmit_oldest()
+                            continue
+                            
+                        # Process ACK (this may trigger fast retransmit)
+                        self.process_ack(ack_segment)
+                        
+                        # After processing ACK, check if we should continue or break
+                        # If window has space now and we have more data, break to send more segments
+                        available = self.get_available_window_space()
+                        if available >= MSS and self.file_pointer < self.file_size:
+                            break
+                        # Otherwise continue to process more ACKs (including duplicates for fast retransmit)
+                            
+                    except timeout:
+                        # No ACK received - this is normal, continue checking
+                        # Timer check happens at the start of the loop
                         continue
-                        
-                    # Decode and verify
-                    ack_segment = URPSegment.decode(ack_segment_raw)
-                    if ack_segment is None:
-                        # Check for timeout
-                        if self.check_timer():
-                            self.retransmit_oldest()
-                        continue
-                        
-                    if not ack_segment.verify_checksum():
-                        self.stats['corrupted_acks_discarded'] += 1
-                        # Check for timeout
-                        if self.check_timer():
-                            self.retransmit_oldest()
-                        continue
-                        
-                    # Process ACK
-                    self.process_ack(ack_segment)
-                        
-                except timeout:
-                    # No ACK received, continue to send more segments if window allows
-                    pass
-                except:
-                    # Other error, continue
-                    pass
+                    except:
+                        # Other error, break
+                        break
                 
         file.close()
         
