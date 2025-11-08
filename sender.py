@@ -163,6 +163,12 @@ class URPSender:
         seg_type = 'SYN' if segment.is_syn() else ('FIN' if segment.is_fin() else 'DATA')
         payload_len = len(segment.payload)
         
+        # Track original statistics BEFORE processing through PLC
+        # Original data sent should count all original segments, even if dropped
+        if not is_retransmission:
+            self.stats['original_segments_sent'] += 1
+            self.stats['original_data_sent'] += payload_len
+        
         # Process through PLC
         processed_data, was_dropped, was_corrupted = self.plc.process_outgoing(
             segment_data, seg_type, segment.seq_num, payload_len, self.get_elapsed_time()
@@ -172,10 +178,7 @@ class URPSender:
             # Send through socket
             self.socket.sendto(processed_data, ('127.0.0.1', self.receiver_port))
             
-            # Track statistics
-            if not is_retransmission:
-                self.stats['original_segments_sent'] += 1
-                self.stats['original_data_sent'] += payload_len
+            # Track total statistics (only for segments that weren't dropped)
             self.stats['total_segments_sent'] += 1
             self.stats['total_data_sent'] += payload_len
             

@@ -158,18 +158,35 @@ class ClientThread(Thread):
         payload = segment.payload
         payload_len = len(payload)
         
-        # Check if duplicate
+        # Check if duplicate (must check BEFORE window check to avoid counting old duplicates as original)
         is_duplicate = seq_num in self.received_seqs
         
-        if not is_duplicate:
+        # Check if segment is within receive window (handle wraparound)
+        # Segments outside window are old duplicates that should not be counted
+        window_end = (self.expected_seq + self.max_win) % 65536
+        in_window = False
+        if self.expected_seq < window_end:
+            # No wraparound case
+            in_window = seq_num >= self.expected_seq and seq_num < window_end
+        else:
+            # Wraparound case: window spans across 65536 boundary
+            in_window = seq_num >= self.expected_seq or seq_num < window_end
+        
+        # Only count as original if not duplicate AND within window
+        # Segments outside window are old duplicates (already ACKed)
+        if not is_duplicate and in_window:
             self.stats['original_segments_received'] += 1
             self.stats['original_data_received'] += payload_len
+            self.stats['total_data_received'] += payload_len
             self.received_seqs.add(seq_num)
-        else:
+        elif is_duplicate:
             self.stats['duplicate_segments_received'] += 1
+            # Count duplicate DATA segment's payload in total_data_received
+            self.stats['total_data_received'] += payload_len
+        # If outside window and not duplicate, it's an old segment - don't count as original
+        # but still count in total_segments_received
             
         self.stats['total_segments_received'] += 1
-        self.stats['total_data_received'] += payload_len
         
         # Check if in-order or out-of-order
         if seq_num == self.expected_seq:
@@ -184,18 +201,7 @@ class ClientThread(Thread):
             self.send_ack(self.expected_seq, is_duplicate=False)
             
         else:
-            # Check if segment is within receive window (handle wraparound)
-            window_end = (self.expected_seq + self.max_win) % 65536
-            
-            # Determine if seq_num is within window
-            in_window = False
-            if self.expected_seq < window_end:
-                # No wraparound case
-                in_window = seq_num > self.expected_seq and seq_num < window_end
-            else:
-                # Wraparound case: window spans across 65536 boundary
-                in_window = seq_num > self.expected_seq or seq_num < window_end
-            
+            # Out-of-order segment (already checked window above)
             if in_window:
                 # Out-of-order segment within window - buffer it
                 if seq_num not in self.receive_buffer:
@@ -287,6 +293,11 @@ class ClientThread(Thread):
                 # Verify checksum
                 if not segment.verify_checksum():
                     # Corrupted segment - discard
+                    # Don't track sequence number yet - only track after successful reception
+                    # This way, retransmissions of corrupted segments will be counted as original
+                    # Don't count corrupted segment's payload in total_data_received
+                    # Don't count corrupted segment in original_segments_received
+                    
                     self.stats['corrupted_segments_discarded'] += 1
                     self.stats['total_segments_received'] += 1
                     self.log_segment('rcv', 'cor', self.get_elapsed_time(), seg_type, segment.seq_num, payload_len)
@@ -294,6 +305,21 @@ class ClientThread(Thread):
                     
                 # Log valid segment
                 self.log_segment('rcv', 'ok', self.get_elapsed_time(), seg_type, segment.seq_num, payload_len)
+                
+                # Track statistics for SYN and FIN segments (DATA is tracked in process_data)
+                seq_num = segment.seq_num
+                if segment.is_syn() or segment.is_fin():
+                    # Check if duplicate SYN/FIN
+                    is_duplicate = seq_num in self.received_seqs
+                    
+                    if not is_duplicate:
+                        self.stats['original_segments_received'] += 1
+                        self.received_seqs.add(seq_num)
+                    else:
+                        self.stats['duplicate_segments_received'] += 1
+                        # Don't count SYN/FIN payload (0) in total_data_received
+                    
+                    self.stats['total_segments_received'] += 1
                 
                 # Process segment based on type
                 if segment.is_syn():
