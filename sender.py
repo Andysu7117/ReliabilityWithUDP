@@ -397,13 +397,23 @@ class URPSender:
         file = open(self.filename, 'rb')
         
         while self.file_pointer < self.file_size:
-            # Check if we can send more data
-            available = self.get_available_window_space()
+            # In sliding window mode, try to send multiple segments before checking ACKs
+            # In stop-and-wait mode, send one segment and wait for ACK
+            segments_sent_this_iteration = 0
             
-            if available >= MSS and self.file_pointer < self.file_size:
-                # Read data from file
-                read_size = min(MSS, self.file_size - self.file_pointer)
-                data = file.read(read_size)
+            # Send as many segments as window allows (for sliding window)
+            while self.file_pointer < self.file_size:
+                # Check if we can send more data
+                available = self.get_available_window_space()
+                
+                # In sliding window mode, break if window is full to check for ACKs
+                if self.max_win > MSS and available < MSS:
+                    break
+                
+                if available >= MSS and self.file_pointer < self.file_size:
+                    # Read data from file
+                    read_size = min(MSS, self.file_size - self.file_pointer)
+                    data = file.read(read_size)
                 
                 if len(data) > 0:
                     # Create DATA segment
@@ -500,49 +510,57 @@ class URPSender:
                         # Continue to next iteration to send next segment
                         continue
                     
+                # In sliding window mode, continue the inner loop to send more segments
+                # The loop will naturally exit when available < MSS or file_pointer >= file_size
+                # In stop-and-wait mode, we already broke out above
+                # No need for explicit break here - let the loop condition handle it
+            
             # Check for incoming ACKs (for sliding window mode)
-            try:
-                self.socket.settimeout(0.01)
-                data, addr = self.socket.recvfrom(1024)
-                
-                # Try to decode first to get sequence number for logging
-                temp_segment = URPSegment.decode(data)
-                ack_seq_num = temp_segment.seq_num if temp_segment else 0
-                
-                # Process through PLC
-                ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
-                    data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
-                )
-                
-                if was_dropped:
-                    # Check for timeout
-                    if self.check_timer():
-                        self.retransmit_oldest()
-                    continue
+            # Only check if we're in sliding window mode
+            if self.max_win > MSS:
+                try:
+                    self.socket.settimeout(0.01)
+                    data, addr = self.socket.recvfrom(1024)
                     
-                # Decode and verify
-                ack_segment = URPSegment.decode(ack_segment_raw)
-                if ack_segment is None:
-                    # Check for timeout
-                    if self.check_timer():
-                        self.retransmit_oldest()
-                    continue
+                    # Try to decode first to get sequence number for logging
+                    temp_segment = URPSegment.decode(data)
+                    ack_seq_num = temp_segment.seq_num if temp_segment else 0
                     
-                if not ack_segment.verify_checksum():
-                    self.stats['corrupted_acks_discarded'] += 1
-                    # Check for timeout
-                    if self.check_timer():
-                        self.retransmit_oldest()
-                    continue
+                    # Process through PLC
+                    ack_segment_raw, was_dropped, was_corrupted = self.plc.process_incoming(
+                        data, 'ACK', ack_seq_num, 0, self.get_elapsed_time()
+                    )
                     
-                # Process ACK
-                self.process_ack(ack_segment)
-                
-            except timeout:
-                # Check for timer expiration
-                if self.check_timer():
-                    self.retransmit_oldest()
-                continue
+                    if was_dropped:
+                        # Check for timeout
+                        if self.check_timer():
+                            self.retransmit_oldest()
+                        continue
+                        
+                    # Decode and verify
+                    ack_segment = URPSegment.decode(ack_segment_raw)
+                    if ack_segment is None:
+                        # Check for timeout
+                        if self.check_timer():
+                            self.retransmit_oldest()
+                        continue
+                        
+                    if not ack_segment.verify_checksum():
+                        self.stats['corrupted_acks_discarded'] += 1
+                        # Check for timeout
+                        if self.check_timer():
+                            self.retransmit_oldest()
+                        continue
+                        
+                    # Process ACK
+                    self.process_ack(ack_segment)
+                        
+                except timeout:
+                    # No ACK received, continue to send more segments if window allows
+                    pass
+                except:
+                    # Other error, continue
+                    pass
                 
         file.close()
         
