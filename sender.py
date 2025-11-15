@@ -182,22 +182,8 @@ class URPSender:
             self.stats['total_segments_sent'] += 1
             self.stats['total_data_sent'] += payload_len
             
-            # If not a retransmission, add to unacked list
-            # (For stop-and-wait DATA, SYN, and FIN, we already added them before sending)
-            # Only add here for sliding window DATA segments
-            if not is_retransmission and self.max_win > MSS:
-                # For sliding window, add to unacked list here
-                # For stop-and-wait DATA, SYN, and FIN, segment was already added before sending
-                with self.window_lock:
-                    self.unacked_segments.append((
-                        segment.seq_num,
-                        segment_data,
-                        payload_len,
-                        time.time()
-                    ))
-                    # Start timer if this is the oldest unacked segment
-                    if len(self.unacked_segments) == 1:
-                        self.start_timer()
+            # Note: Segments are now added to unacked_segments BEFORE calling send_segment
+            # This ensures dropped segments are still tracked for retransmission
                         
     def retransmit_oldest(self):
         """
@@ -335,7 +321,7 @@ class URPSender:
                         segments_removed += 1
                     else:
                         break
-                
+
                 # Only update send_base if we actually removed segments
                 if segments_removed > 0:
                     print(f"[DEBUG] process_ack: Removed {segments_removed} segments, updating send_base to {ack_num}")
@@ -385,24 +371,10 @@ class URPSender:
                         else:
                             print(f"[DEBUG] process_ack: ACK {ack_num} != oldest_seq {oldest_seq}, not a duplicate ACK")
 
-            # Check for duplicate ACK (same ACK number as last one)
-            if self.last_ack_num is not None and ack_num == self.last_ack_num:
-                print(f"[DEBUG] process_ack: Duplicate ACK detected (same as last): ack_num={ack_num}, dup_count={self.dup_ack_count + 1}")
-                # Duplicate ACK (same ACK number as last one)
-                self.dup_ack_count += 1
-                self.stats['duplicate_acks_received'] += 1
-
-                # Fast retransmit on >=3 duplicate ACKs
-                if self.dup_ack_count >= 3 and self.max_win > MSS:
-                    print(f"[DEBUG] process_ack: Triggering fast retransmit! dup_count={self.dup_ack_count}, max_win={self.max_win}, MSS={MSS}")
-                    self.retransmit_oldest()
-                else:
-                    print(f"[DEBUG] process_ack: Not retransmitting yet: dup_count={self.dup_ack_count}, max_win={self.max_win}, MSS={MSS}")
-                return True
-
             # Check if ACK is for an unacked segment (duplicate ACK pattern)
-            # If ACK number equals the oldest unacked segment's sequence number,
-            # it means the receiver hasn't received that segment yet (duplicate ACK)
+            # A duplicate ACK for fast retransmit only occurs when:
+            # 1. The ACK number equals the sequence number of the oldest unacked segment
+            # 2. This means the receiver is waiting for that segment (it received later segments out of order)
             if len(self.unacked_segments) > 0:
                 oldest_seq, _, oldest_payload_len, _ = self.unacked_segments[0]
                 print(f"[DEBUG] process_ack: Checking if ACK {ack_num} matches oldest_seq {oldest_seq}")
@@ -430,7 +402,21 @@ class URPSender:
                         print(f"[DEBUG] process_ack: Not retransmitting yet: dup_count={self.dup_ack_count}, max_win={self.max_win}, MSS={MSS}")
                     return True
                 else:
-                    print(f"[DEBUG] process_ack: ACK {ack_num} != oldest_seq {oldest_seq}")
+                    print(f"[DEBUG] process_ack: ACK {ack_num} != oldest_seq {oldest_seq}, not a duplicate ACK for fast retransmit")
+                    
+            # If ACK is less than send_base, it's an old ACK - ignore it
+            if self.seq_lt(ack_num, self.send_base):
+                print(f"[DEBUG] process_ack: Old ACK (ack_num={ack_num} < send_base={self.send_base}), ignoring")
+                return True
+            
+            # If ACK equals send_base but doesn't acknowledge any segments, it's a duplicate ACK
+            # This can happen when a segment was dropped and the receiver keeps sending the same ACK
+            # We should ignore it and let timeout handle retransmission
+            if ack_num == self.send_base and len(self.unacked_segments) > 0:
+                oldest_seq, _, _, _ = self.unacked_segments[0]
+                if oldest_seq != ack_num:
+                    print(f"[DEBUG] process_ack: ACK {ack_num} equals send_base but doesn't match oldest_seq {oldest_seq}, ignoring (will retransmit on timeout)")
+                    return True
 
             # Old ACK or first ACK (last_ack_num is None)
             # Set last_ack_num so we can detect duplicates next time
@@ -439,7 +425,6 @@ class URPSender:
                 self.last_ack_num = ack_num
             else:
                 print(f"[DEBUG] process_ack: Old ACK or other case, last_ack_num={self.last_ack_num}, ack_num={ack_num}")
-            # If ack_num < send_base, it's an old ACK - ignore it
             return True
         
     def connection_setup(self):
@@ -555,25 +540,28 @@ class URPSender:
                     current_seq = self.next_seq
                     current_payload_len = len(data)
                     data_segment = URPSegment(current_seq, 0, data)
+                    segment_data = data_segment.encode()
                     
-                    # In stop-and-wait mode, track segment before sending
-                    # so we can retransmit even if dropped
-                    if self.max_win == MSS:
-                        # For stop-and-wait, ensure segment is tracked for retransmission
-                        # even if dropped by PLC
-                        segment_data = data_segment.encode()
-                        with self.window_lock:
-                            # Check if this segment is already tracked
-                            if len(self.unacked_segments) == 0 or self.unacked_segments[0][0] != current_seq:
-                                self.unacked_segments.append((
-                                    current_seq,
-                                    segment_data,
-                                    current_payload_len,
-                                    time.time()
-                                ))
-                                # Start timer if this is the oldest unacked segment
-                                if len(self.unacked_segments) == 1:
-                                    self.start_timer()
+                    # Track segment BEFORE sending so we can retransmit even if dropped
+                    # This applies to both stop-and-wait and sliding window modes
+                    with self.window_lock:
+                        # Check if this segment is already tracked
+                        already_tracked = False
+                        for seq_num, _, _, _ in self.unacked_segments:
+                            if seq_num == current_seq:
+                                already_tracked = True
+                                break
+                        
+                        if not already_tracked:
+                            self.unacked_segments.append((
+                                current_seq,
+                                segment_data,
+                                current_payload_len,
+                                time.time()
+                            ))
+                            # Start timer if this is the oldest unacked segment
+                            if len(self.unacked_segments) == 1:
+                                self.start_timer()
                     
                     self.send_segment(data_segment)
                     
