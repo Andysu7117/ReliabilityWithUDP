@@ -46,7 +46,7 @@ class PLC:
         # Check for corruption
         was_corrupted = False
         if random.random() < self.fcp:
-            # Corrupt a random byte (excluding first 4 header bytes)
+            # Corrupt a random byte (excluding first 4 header bytes).
             if len(segment_data) > 4:
                 corrupt_pos = random.randint(4, len(segment_data) - 1)
                 byte_val = segment_data[corrupt_pos]
@@ -77,7 +77,7 @@ class PLC:
         # Check for corruption
         was_corrupted = False
         if random.random() < self.rcp:
-            # Corrupt a random byte (excluding first 4 header bytes)
+            # Corrupt a random byte (excluding first 4 header bytes).
             if len(segment_data) > 4:
                 corrupt_pos = random.randint(4, len(segment_data) - 1)
                 byte_val = segment_data[corrupt_pos]
