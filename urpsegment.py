@@ -2,19 +2,15 @@ import struct
 
 HEADER_SIZE = 6  # URP header size in bytes
 class URPSegment:
+    """Handles encoding/decoding of the 6-byte header format."""
     def __init__(self, seq_num=0, flags=0, payload=b''):
-        """
-        Args:
-            seq_num: 16-bit sequence number
-            flags: 3-bit flags (ACK=1, SYN=2, FIN=4)
-            payload: Data payload (bytes)
-        """
         self.seq_num = seq_num & 0xFFFF  # Ensure 16-bit
         self.flags = flags & 0x07  # Ensure 3-bit
         self.payload = payload
         self.checksum = 0
         
     def set_flag(self, flag_name):
+        """Set a flag."""
         if flag_name == 'ACK':
             self.flags = 1
         elif flag_name == 'SYN':
@@ -25,22 +21,23 @@ class URPSegment:
             self.flags = 0
             
     def is_ack(self):
+        """Check segment is ACK."""
         return self.flags == 1
         
     def is_syn(self):
+        """Check segment is SYN."""
         return self.flags == 2
         
     def is_fin(self):
+        """Check segment is FIN."""
         return self.flags == 4
         
     def is_data(self):
+        """Check segment is a DATA segment."""
         return self.flags == 0
         
-    def compute_checksum(self):
-        """
-        Compute 16-bit checksum for error detection.
-        Uses ones' complement sum (similar to TCP/UDP checksum).
-        """
+    def calc_checksum(self):
+        """Ones complement checksum."""
         checksum = 0
         
         checksum += (self.seq_num >> 8) & 0xFF
@@ -56,11 +53,11 @@ class URPSegment:
         while checksum >> 16:
             checksum = (checksum & 0xFFFF) + (checksum >> 16)
             
-        # Ones' complement.
         self.checksum = (~checksum) & 0xFFFF
         return self.checksum
         
-    def verify_checksum(self):
+    def check_checksum(self):
+        """Verify the checksum of the received segment."""
         checksum_sum = 0
         
         checksum_sum += (self.seq_num >> 8) & 0xFF
@@ -85,10 +82,10 @@ class URPSegment:
         return total == 0xFFFF
         
     def encode(self):
-        self.compute_checksum()
+        """Encode segment into bytes for transmission."""
+        self.calc_checksum()
         
         # Pack header: sequence number (2 bytes), reserved+flags (2 bytes), checksum (2 bytes).
-        # Network byte order (big-endian).
         header = struct.pack('>H', self.seq_num)
         flags_reserved = struct.pack('>H', (self.flags << 13))
         checksum = struct.pack('>H', self.checksum)
@@ -97,6 +94,7 @@ class URPSegment:
         
     @staticmethod
     def decode(data):
+        """Decode the bytes into a URP segment."""
         if len(data) < HEADER_SIZE:
             return None
             
@@ -104,7 +102,7 @@ class URPSegment:
             # Extract header fields.
             seq_num = struct.unpack('>H', data[0:2])[0]
             
-            # Extract flags (bits 13-15 of the reserved+flags field).
+            # Extract flags.
             flags_reserved = struct.unpack('>H', data[2:4])[0]
             flags = (flags_reserved >> 13) & 0x07
             

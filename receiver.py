@@ -1,3 +1,7 @@
+"""
+URP Receiver Implementation
+Usage: python3 receiver.py receiver_port sender_port txt_file_received max_win
+"""
 from socket import *
 from threading import Thread, Lock
 from queue import Queue
@@ -14,34 +18,22 @@ ESTABLISHED = "ESTABLISHED"
 TIME_WAIT = "TIME_WAIT"
 
 class ClientThread(Thread):
-    """
-    Thread class to handle each client connection.
-    Each instance handles one complete URP connection lifecycle.
-    """
-    def __init__(self, client_address, receiver_socket, sender_port, filename, max_win, message_queue):
-        """
-        Args:
-            client_address: Address of the client (sender)
-            receiver_socket: Shared UDP socket for sending ACKs
-            sender_port: Port to send ACKs to
-            filename: File to write received data
-            max_win: Maximum receive window size
-            message_queue: Queue to receive segments from main server thread
-        """
+    """To handle each client connection."""
+    def __init__(self, client_addr, receiver_sock, sender_port, filename, max_win, msg_queue):
         Thread.__init__(self)
-        self.client_address = client_address
-        self.receiver_socket = receiver_socket
+        self.client_addr = client_addr
+        self.receiver_sock = receiver_sock
         self.sender_port = sender_port
         self.filename = filename
         self.max_win = max_win
-        self.message_queue = message_queue
+        self.msg_queue = msg_queue
         self.client_alive = True
         
         self.state = LISTEN
         self.expected_seq = 0  # Next expected sequence number
         self.isn = None  # Initial sequence number from SYN
         
-        self.receive_buffer = {}  # seq_num -> (data, payload_len)
+        self.receive_buff = {}  # seq_num -> (data, payload_len)
         self.received_seqs = set()  # Track received sequence numbers
         
         self.output_file = None
@@ -61,43 +53,40 @@ class ClientThread(Thread):
         self.log_file = open('receiver_log.txt', 'w')
         self.start_time = None
         
-    def log_segment(self, direction, status, time_ms, seg_type, seq_num, payload_len):
-        """
-        Log a segment event to the log file.
-        """
+    def log_seg(self, direction, status, time_ms, seg_type, seq_num, payload_len):
+        """Put segment event to the log file."""
         self.log_file.write(f"{direction} {status} {time_ms:.2f} {seg_type} {seq_num} {payload_len}\n")
         self.log_file.flush()
         
-    def get_elapsed_time(self):
+    def get_time_elapsed(self):
+        """Get time elapsed in ms since start."""
         if self.start_time is None:
             return 0.0
         return (time.time() - self.start_time) * 1000.0
         
-    def send_ack(self, ack_num, is_duplicate=False):
-        """
-        Args:
-            ack_num: Acknowledgment number (next expected sequence number)
-            is_duplicate: True if this is a duplicate ACK
-        """
-        ack_segment = URPSegment(ack_num, 0, b'')
-        ack_segment.set_flag('ACK')
+    def send_ack(self, ack_num, is_dup=False):
+        """send an ACK segment."""
+        ack_seg = URPSegment(ack_num, 0, b'')
+        ack_seg.set_flag('ACK')
         
-        segment_data = ack_segment.encode()
-        self.receiver_socket.sendto(segment_data, ('127.0.0.1', self.sender_port))
+        seg_data = ack_seg.encode()
+        self.receiver_sock.sendto(seg_data, ('127.0.0.1', self.sender_port))
         
         self.stats['total_acks_sent'] += 1
-        if is_duplicate:
+        if is_dup:
             self.stats['duplicate_acks_sent'] += 1
             
-        self.log_segment('snd', 'ok', self.get_elapsed_time(), 'ACK', ack_num, 0)
+        self.log_seg('snd', 'ok', self.get_time_elapsed(), 'ACK', ack_num, 0)
         
-    def write_data_to_file(self):
-        while self.expected_seq in self.receive_buffer:
-            data, payload_len = self.receive_buffer.pop(self.expected_seq)
+    def write_data(self):
+        """Writes in order data to file from receive buffer."""
+        while self.expected_seq in self.receive_buff:
+            data, payload_len = self.receive_buff.pop(self.expected_seq)
             self.output_file.write(data)
             self.expected_seq = (self.expected_seq + payload_len) % 65536
             
-    def process_syn(self, segment):
+    def proc_syn(self, segment):
+        """Process SYN segment."""
         if self.state != LISTEN:
             return False
             
@@ -112,7 +101,8 @@ class ClientThread(Thread):
         
         return True
         
-    def process_data(self, segment):
+    def proc_data(self, segment):
+        """Process DATA segment."""
         if self.state != ESTABLISHED:
             return False
             
@@ -120,23 +110,23 @@ class ClientThread(Thread):
         payload = segment.payload
         payload_len = len(payload)
         
-        is_duplicate = seq_num in self.received_seqs
+        is_dup = seq_num in self.received_seqs
         
-        window_end = (self.expected_seq + self.max_win) % 65536
-        in_window = False
-        if self.expected_seq < window_end:
+        win_end = (self.expected_seq + self.max_win) % 65536
+        in_win = False
+        if self.expected_seq < win_end:
             # No wraparound case.
-            in_window = seq_num >= self.expected_seq and seq_num < window_end
+            in_win = seq_num >= self.expected_seq and seq_num < win_end
         else:
             # Wraparound case.
-            in_window = seq_num >= self.expected_seq or seq_num < window_end
+            in_win = seq_num >= self.expected_seq or seq_num < win_end
         
-        if not is_duplicate and in_window:
+        if not is_dup and in_win:
             self.stats['original_segments_received'] += 1
             self.stats['original_data_received'] += payload_len
             self.stats['total_data_received'] += payload_len
             self.received_seqs.add(seq_num)
-        elif is_duplicate:
+        elif is_dup:
             self.stats['duplicate_segments_received'] += 1
             self.stats['total_data_received'] += payload_len
             
@@ -147,30 +137,29 @@ class ClientThread(Thread):
             self.output_file.write(payload)
             self.expected_seq = (self.expected_seq + payload_len) % 65536
             
-            self.write_data_to_file()
+            self.write_data()
             
-            self.send_ack(self.expected_seq, is_duplicate=False)
+            self.send_ack(self.expected_seq, is_dup=False)
             
-        else:
-            # Out-of-order segment.
-            if in_window:
-                if seq_num not in self.receive_buffer:
-                    self.receive_buffer[seq_num] = (payload, payload_len)
+        else: # Out-of-order segment.
+            if in_win:
+                if seq_num not in self.receive_buff:
+                    self.receive_buff[seq_num] = (payload, payload_len)
                     
-                self.send_ack(self.expected_seq, is_duplicate=True)
-            else:
-                # Segment outside window.
-                self.send_ack(self.expected_seq, is_duplicate=True)
+                self.send_ack(self.expected_seq, is_dup=True)
+            else: # Segment outside window.
+                self.send_ack(self.expected_seq, is_dup=True)
             
         return True
         
-    def process_fin(self, segment):
+    def proc_fin(self, segment):
+        """Process a FIN segment."""
         if self.state != ESTABLISHED:
             return False
             
         fin_seq = segment.seq_num
         
-        self.write_data_to_file()
+        self.write_data()
         
         if self.output_file:
             self.output_file.close()
@@ -183,8 +172,9 @@ class ClientThread(Thread):
         
         return True
         
-    def time_wait_timer(self):
-        time.sleep(2 * MSL)  # Wait 2 MSL
+    def wait_timer(self):
+        """have to wait if status is  TIME_WAIT."""
+        time.sleep(2 * MSL)
         self.state = CLOSED
         
     def run(self):
@@ -193,43 +183,43 @@ class ClientThread(Thread):
         while self.client_alive:
             try:
                 try:
-                    data, addr = self.message_queue.get(timeout=0.1)
+                    data, addr = self.msg_queue.get(timeout=0.1)
                 except:
                     continue
                 
-                segment = URPSegment.decode(data)
-                if segment is None:
+                seg = URPSegment.decode(data)
+                if seg is None:
                     continue
                     
                 if self.start_time is None:
                     self.start_time = time.time()
                     
-                if segment.is_syn():
+                if seg.is_syn():
                     seg_type = 'SYN'
                     payload_len = 0
-                elif segment.is_fin():
+                elif seg.is_fin():
                     seg_type = 'FIN'
                     payload_len = 0
-                elif segment.is_data():
+                elif seg.is_data():
                     seg_type = 'DATA'
-                    payload_len = len(segment.payload)
+                    payload_len = len(seg.payload)
                 else:
                     continue 
                     
                 # Verify checksum.
-                if not segment.verify_checksum():            
+                if not seg.check_checksum():            
                     self.stats['corrupted_segments_discarded'] += 1
                     self.stats['total_segments_received'] += 1
-                    self.log_segment('rcv', 'cor', self.get_elapsed_time(), seg_type, segment.seq_num, payload_len)
+                    self.log_seg('rcv', 'cor', self.get_time_elapsed(), seg_type, seg.seq_num, payload_len)
                     continue
                     
-                self.log_segment('rcv', 'ok', self.get_elapsed_time(), seg_type, segment.seq_num, payload_len)
+                self.log_seg('rcv', 'ok', self.get_time_elapsed(), seg_type, seg.seq_num, payload_len)
                 
-                seq_num = segment.seq_num
-                if segment.is_syn() or segment.is_fin():
-                    is_duplicate = seq_num in self.received_seqs
+                seq_num = seg.seq_num
+                if seg.is_syn() or seg.is_fin():
+                    is_dup = seq_num in self.received_seqs
                     
-                    if not is_duplicate:
+                    if not is_dup:
                         self.stats['original_segments_received'] += 1
                         self.received_seqs.add(seq_num)
                     else:
@@ -238,68 +228,68 @@ class ClientThread(Thread):
                     self.stats['total_segments_received'] += 1
                 
                 # Process segment based on type.
-                if segment.is_syn():
-                    if not self.process_syn(segment):
+                if seg.is_syn():
+                    if not self.proc_syn(seg):
                         print(f"Connection reset: Unexpected SYN from {addr}")
                         break
                         
-                elif segment.is_data():
-                    if not self.process_data(segment):
+                elif seg.is_data():
+                    if not self.proc_data(seg):
                         print(f"Connection reset: Unexpected DATA from {addr}")
                         break
                         
-                elif segment.is_fin():
-                    if not self.process_fin(segment):
+                elif seg.is_fin():
+                    if not self.proc_fin(seg):
                         print(f"Connection reset: Unexpected FIN from {addr}")
                         break
                     
-                    timer_thread = Thread(target=self.time_wait_timer)
+                    timer_thread = Thread(target=self.wait_timer)
                     timer_thread.start()
                     
                     while self.state == TIME_WAIT:
                         try:
                             try:
-                                data, addr = self.message_queue.get(timeout=0.1)
+                                data, addr = self.msg_queue.get(timeout=0.1)
                             except:
                                 if self.state == CLOSED:
                                     break
                                 continue
                             
-                            segment = URPSegment.decode(data)
-                            if segment and segment.is_fin():
-                                fin_seq = segment.seq_num
+                            seg = URPSegment.decode(data)
+                            if seg and seg.is_fin():
+                                fin_seq = seg.seq_num
                                 ack_num = (fin_seq + 1) % 65536
                                 self.send_ack(ack_num)
                                 
-                                if segment.verify_checksum():
-                                    self.log_segment('rcv', 'ok', self.get_elapsed_time(), 'FIN', fin_seq, 0)
+                                if seg.check_checksum():
+                                    self.log_seg('rcv', 'ok', self.get_time_elapsed(), 'FIN', fin_seq, 0)
                                 else:
                                     self.stats['corrupted_segments_discarded'] += 1
-                                    self.log_segment('rcv', 'cor', self.get_elapsed_time(), 'FIN', fin_seq, 0)
+                                    self.log_seg('rcv', 'cor', self.get_time_elapsed(), 'FIN', fin_seq, 0)
                                     
                         except timeout:
                             if self.state == CLOSED:
                                 break
                             continue
                             
-                    self.client_alive = False  # Connection closed.
+                    self.client_alive = False
                     break
                     
             except Exception as e:
                 if self.state == CLOSED:
                     break
-                print(f"Connection reset: {e} from {self.client_address}")
+                print(f"Connection reset: {e} from {self.client_addr}")
                 break
             
         # Write final statistics.
-        self.write_statistics()
+        self.write_stats()
         self.log_file.close()
         self.client_alive = False
         
-        print(f"===== Connection closed for: {self.client_address}")
+        print(f"===== Connection closed for: {self.client_addr}")
         
-    def write_statistics(self):
-        """Write statistics to log file."""
+    def write_stats(self):
+        """Write stats to log file."""
         self.log_file.write(f"\nOriginal data received: {self.stats['original_data_received']}\n")
         self.log_file.write(f"Total data received: {self.stats['total_data_received']}\n")
         self.log_file.write(f"Original segments received: {self.stats['original_segments_received']}\n")
@@ -310,53 +300,45 @@ class ClientThread(Thread):
         self.log_file.write(f"Duplicate acks sent: {self.stats['duplicate_acks_sent']}\n")
 
 class URPReceiver:
+    """Accept connections and create handler threads."""
     def __init__(self, receiver_port, sender_port, filename, max_win):
-        """
-        Args:
-            receiver_port: UDP port for receiver
-            sender_port: UDP port for sender
-            filename: File to write received data
-            max_win: Maximum receive window size
-        """
         self.receiver_port = receiver_port
         self.sender_port = sender_port
         self.filename = filename
         self.max_win = max_win
         
-        self.server_socket = socket(AF_INET, SOCK_DGRAM)
-        self.server_socket.bind(('127.0.0.1', receiver_port))
-        
-        # Track active client threads.
+        self.server_sock = socket(AF_INET, SOCK_DGRAM)
+        self.server_sock.bind(('127.0.0.1', receiver_port))
+
         self.active_threads = []
         self.threads_lock = Lock()
-        self.client_queues = {}  # client_address -> Queue
+        self.client_queues = {}
         self.queues_lock = Lock()
         
     def run(self):
         print("\n===== Server is running =====")
         print("===== Waiting for connection request from clients...=====")
 
-        # Track seen clients.
         seen_clients = {}
 
         while True:
             try:
-                data, client_addr = self.server_socket.recvfrom(1024 + HEADER_SIZE)
+                data, client_addr = self.server_sock.recvfrom(1024 + HEADER_SIZE)
 
                 segment = URPSegment.decode(data)
                 if segment is None:
                     continue
                 
-                if segment.is_syn() and segment.verify_checksum():
-                    need_new_connection = False
+                if segment.is_syn() and segment.check_checksum():
+                    new_conn = False
                     
                     if client_addr not in seen_clients:
-                        need_new_connection = True
+                        new_conn = True
                     else:
                         with self.threads_lock:
                             old_thread = seen_clients.get(client_addr)
                             if old_thread is None or not old_thread.is_alive():
-                                need_new_connection = True
+                                new_conn = True
                                 if old_thread and old_thread in self.active_threads:
                                     self.active_threads.remove(old_thread)
                                 with self.queues_lock:
@@ -365,12 +347,12 @@ class URPReceiver:
                                 del seen_clients[client_addr]
                                 print(f"===== Previous connection finished for {client_addr}, ready for new connection")
                     
-                    if need_new_connection:
+                    if new_conn:
                         client_queue = Queue()
                         
                         client_thread = ClientThread(
                             client_addr, 
-                            self.server_socket, 
+                            self.server_sock, 
                             self.sender_port, 
                             self.filename, 
                             self.max_win,
@@ -420,10 +402,9 @@ class URPReceiver:
             for thread in self.active_threads:
                 thread.join()
                 
-        self.server_socket.close()
+        self.server_sock.close()
 
 def main():
-    """Main entry point for URP Receiver."""
     if len(sys.argv) != 5:
         print("\n===== Error usage, python3 receiver.py receiver_port sender_port txt_file_received max_win ======\n")
         sys.exit(1)
